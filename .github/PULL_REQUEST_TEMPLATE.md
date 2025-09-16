@@ -1,6 +1,6 @@
 ## 相关Issue
-<!-- 关联的Issue编号，如 issue #123 -->
-- issue # 
+<!-- 关联的Issue编号，如 Closes #123 -->
+- Closes # 
 
 ## 变更类型
 - [ ] 新功能（feature）
