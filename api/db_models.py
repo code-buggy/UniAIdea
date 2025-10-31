@@ -1,0 +1,380 @@
+#  This project was created by the UniAIdea team.
+
+import logging
+import inspect
+import os
+import sys
+import typing
+import operator
+from enum import Enum
+from functools import wraps
+from itsdangerous.url_safe import URLSafeTimedSerializer as Serializer
+from flask_login import UserMixin
+from playhouse.migrate import MySQLMigrator, PostgresqlMigrator, migrate
+from peewee import (
+    BigIntegerField, BooleanField, CharField,
+    CompositeKey, IntegerField, TextField, FloatField, DateTimeField,
+    Field, Model, Metadata
+)
+from playhouse.pool import PooledMySQLDatabase, PooledPostgresqlDatabase
+
+from api.db import SerializedType, ParserType
+from api import settings
+from api import utils
+
+
+def singleton(cls, *args, **kw):
+    instances = {}
+
+    def _singleton():
+        key = str(cls) + str(os.getpid())
+        if key not in instances:
+            instances[key] = cls(*args, **kw)
+        return instances[key]
+
+    return _singleton
+
+
+CONTINUOUS_FIELD_TYPE = {IntegerField, FloatField, DateTimeField}
+AUTO_DATE_TIMESTAMP_FIELD_PREFIX = {
+    "create",
+    "start",
+    "end",
+    "update",
+    "read_access",
+    "write_access"}
+
+
+class TextFieldType(Enum):
+    MYSQL = 'LONGTEXT'
+    POSTGRES = 'TEXT'
+
+
+class LongTextField(TextField):
+    field_type = TextFieldType[settings.DATABASE_TYPE.upper()].value
+
+
+class JSONField(LongTextField):
+    default_value = {}
+
+    def __init__(self, object_hook=None, object_pairs_hook=None, **kwargs):
+        self._object_hook = object_hook
+        self._object_pairs_hook = object_pairs_hook
+        super().__init__(**kwargs)
+
+    def db_value(self, value):
+        if value is None:
+            value = self.default_value
+        return utils.json_dumps(value)
+
+    def python_value(self, value):
+        if not value:
+            return self.default_value
+        return utils.json_loads(
+            value, object_hook=self._object_hook, object_pairs_hook=self._object_pairs_hook)
+
+
+class ListField(JSONField):
+    default_value = []
+
+
+class SerializedField(LongTextField):
+    def __init__(self, serialized_type=SerializedType.PICKLE,
+                 object_hook=None, object_pairs_hook=None, **kwargs):
+        self._serialized_type = serialized_type
+        self._object_hook = object_hook
+        self._object_pairs_hook = object_pairs_hook
+        super().__init__(**kwargs)
+
+    def db_value(self, value):
+        if self._serialized_type == SerializedType.PICKLE:
+            return utils.serialize_b64(value, to_str=True)
+        elif self._serialized_type == SerializedType.JSON:
+            if value is None:
+                return None
+            return utils.json_dumps(value, with_type=True)
+        else:
+            raise ValueError(
+                f"the serialized type {self._serialized_type} is not supported")
+
+    def python_value(self, value):
+        if self._serialized_type == SerializedType.PICKLE:
+            return utils.deserialize_b64(value)
+        elif self._serialized_type == SerializedType.JSON:
+            if value is None:
+                return {}
+            return utils.json_loads(
+                value, object_hook=self._object_hook, object_pairs_hook=self._object_pairs_hook)
+        else:
+            raise ValueError(
+                f"the serialized type {self._serialized_type} is not supported")
+
+
+def is_continuous_field(cls: typing.Type) -> bool:
+    if cls in CONTINUOUS_FIELD_TYPE:
+        return True
+    for p in cls.__bases__:
+        if p in CONTINUOUS_FIELD_TYPE:
+            return True
+        elif p is not Field and p is not object:
+            if is_continuous_field(p):
+                return True
+    else:
+        return False
+
+
+def auto_date_timestamp_field():
+    return {f"{f}_time" for f in AUTO_DATE_TIMESTAMP_FIELD_PREFIX}
+
+
+def auto_date_timestamp_db_field():
+    return {f"f_{f}_time" for f in AUTO_DATE_TIMESTAMP_FIELD_PREFIX}
+
+
+def remove_field_name_prefix(field_name):
+    return field_name[2:] if field_name.startswith('f_') else field_name
+
+
+class BaseModel(Model):
+    create_time = BigIntegerField(null=True, index=True)
+    create_date = DateTimeField(null=True, index=True)
+    update_time = BigIntegerField(null=True, index=True)
+    update_date = DateTimeField(null=True, index=True)
+
+    def to_json(self):
+        # This function is obsolete
+        return self.to_dict()
+
+    def to_dict(self):
+        return self.__dict__['__data__']
+
+    def to_human_model_dict(self, only_primary_with: list = None):
+        model_dict = self.__dict__['__data__']
+
+        if not only_primary_with:
+            return {remove_field_name_prefix(
+                k): v for k, v in model_dict.items()}
+
+        human_model_dict = {}
+        for k in self._meta.primary_key.field_names:
+            human_model_dict[remove_field_name_prefix(k)] = model_dict[k]
+        for k in only_primary_with:
+            human_model_dict[k] = model_dict[f'f_{k}']
+        return human_model_dict
+
+    @property
+    def meta(self) -> Metadata:
+        return self._meta
+
+    @classmethod
+    def get_primary_keys_name(cls):
+        return cls._meta.primary_key.field_names if isinstance(cls._meta.primary_key, CompositeKey) else [
+            cls._meta.primary_key.name]
+
+    @classmethod
+    def getter_by(cls, attr):
+        return operator.attrgetter(attr)(cls)
+
+    @classmethod
+    def query(cls, reverse=None, order_by=None, **kwargs):
+        filters = []
+        for f_n, f_v in kwargs.items():
+            attr_name = '%s' % f_n
+            if not hasattr(cls, attr_name) or f_v is None:
+                continue
+            if type(f_v) in {list, set}:
+                f_v = list(f_v)
+                if is_continuous_field(type(getattr(cls, attr_name))):
+                    if len(f_v) == 2:
+                        for i, v in enumerate(f_v):
+                            if isinstance(
+                                    v, str) and f_n in auto_date_timestamp_field():
+                                # time type: %Y-%m-%d %H:%M:%S
+                                f_v[i] = utils.date_string_to_timestamp(v)
+                        lt_value = f_v[0]
+                        gt_value = f_v[1]
+                        if lt_value is not None and gt_value is not None:
+                            filters.append(
+                                cls.getter_by(attr_name).between(
+                                    lt_value, gt_value))
+                        elif lt_value is not None:
+                            filters.append(
+                                operator.attrgetter(attr_name)(cls) >= lt_value)
+                        elif gt_value is not None:
+                            filters.append(
+                                operator.attrgetter(attr_name)(cls) <= gt_value)
+                else:
+                    filters.append(operator.attrgetter(attr_name)(cls) << f_v)
+            else:
+                filters.append(operator.attrgetter(attr_name)(cls) == f_v)
+        if filters:
+            query_records = cls.select().where(*filters)
+            if reverse is not None:
+                if not order_by or not hasattr(cls, f"{order_by}"):
+                    order_by = "create_time"
+                if reverse is True:
+                    query_records = query_records.order_by(
+                        cls.getter_by(f"{order_by}").desc())
+                elif reverse is False:
+                    query_records = query_records.order_by(
+                        cls.getter_by(f"{order_by}").asc())
+            return [query_record for query_record in query_records]
+        else:
+            return []
+
+    @classmethod
+    def insert(cls, __data=None, **insert):
+        if isinstance(__data, dict) and __data:
+            __data[cls._meta.combined["create_time"]
+            ] = utils.current_timestamp()
+        if insert:
+            insert["create_time"] = utils.current_timestamp()
+
+        return super().insert(__data, **insert)
+
+    # update and insert will call this method
+    @classmethod
+    def _normalize_data(cls, data, kwargs):
+        normalized = super()._normalize_data(data, kwargs)
+        if not normalized:
+            return {}
+
+        normalized[cls._meta.combined["update_time"]
+        ] = utils.current_timestamp()
+
+        for f_n in AUTO_DATE_TIMESTAMP_FIELD_PREFIX:
+            if {f"{f_n}_time", f"{f_n}_date"}.issubset(cls._meta.combined.keys()) and \
+                    cls._meta.combined[f"{f_n}_time"] in normalized and \
+                    normalized[cls._meta.combined[f"{f_n}_time"]] is not None:
+                normalized[cls._meta.combined[f"{f_n}_date"]] = utils.timestamp_to_date(
+                    normalized[cls._meta.combined[f"{f_n}_time"]])
+
+        return normalized
+
+
+class JsonSerializedField(SerializedField):
+    def __init__(self, object_hook=utils.from_dict_hook,
+                 object_pairs_hook=None, **kwargs):
+        super(JsonSerializedField, self).__init__(serialized_type=SerializedType.JSON, object_hook=object_hook,
+                                                  object_pairs_hook=object_pairs_hook, **kwargs)
+
+
+class PooledDatabase(Enum):
+    MYSQL = PooledMySQLDatabase
+    POSTGRES = PooledPostgresqlDatabase
+
+
+class DatabaseMigrator(Enum):
+    MYSQL = MySQLMigrator
+    POSTGRES = PostgresqlMigrator
+
+
+@singleton
+class BaseDataBase:
+    def __init__(self):
+        database_config = settings.DATABASE.copy()
+        db_name = database_config.pop("name")
+        self.database_connection = PooledDatabase[settings.DATABASE_TYPE.upper()].value(db_name, **database_config)
+        logging.info('init database on cluster mode successfully')
+
+
+class PostgresDatabaseLock:
+    def __init__(self, lock_name, timeout=10, db=None):
+        self.lock_name = lock_name
+        self.timeout = int(timeout)
+        self.db = db if db else DB
+
+    def lock(self):
+        cursor = self.db.execute_sql("SELECT pg_try_advisory_lock(%s)", self.timeout)
+        ret = cursor.fetchone()
+        if ret[0] == 0:
+            raise Exception(f'acquire postgres lock {self.lock_name} timeout')
+        elif ret[0] == 1:
+            return True
+        else:
+            raise Exception(f'failed to acquire lock {self.lock_name}')
+
+    def unlock(self):
+        cursor = self.db.execute_sql("SELECT pg_advisory_unlock(%s)", self.timeout)
+        ret = cursor.fetchone()
+        if ret[0] == 0:
+            raise Exception(
+                f'postgres lock {self.lock_name} was not established by this thread')
+        elif ret[0] == 1:
+            return True
+        else:
+            raise Exception(f'postgres lock {self.lock_name} does not exist')
+
+    def __enter__(self):
+        if isinstance(self.db, PostgresDatabaseLock):
+            self.lock()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if isinstance(self.db, PostgresDatabaseLock):
+            self.unlock()
+
+    def __call__(self, func):
+        @wraps(func)
+        def magic(*args, **kwargs):
+            with self:
+                return func(*args, **kwargs)
+
+        return magic
+
+
+class MysqlDatabaseLock:
+    def __init__(self, lock_name, timeout=10, db=None):
+        self.lock_name = lock_name
+        self.timeout = int(timeout)
+        self.db = db if db else DB
+
+    def lock(self):
+        # SQL parameters only support %s format placeholders
+        cursor = self.db.execute_sql(
+            "SELECT GET_LOCK(%s, %s)", (self.lock_name, self.timeout))
+        ret = cursor.fetchone()
+        if ret[0] == 0:
+            raise Exception(f'acquire mysql lock {self.lock_name} timeout')
+        elif ret[0] == 1:
+            return True
+        else:
+            raise Exception(f'failed to acquire lock {self.lock_name}')
+
+    def unlock(self):
+        cursor = self.db.execute_sql(
+            "SELECT RELEASE_LOCK(%s)", (self.lock_name,))
+        ret = cursor.fetchone()
+        if ret[0] == 0:
+            raise Exception(
+                f'mysql lock {self.lock_name} was not established by this thread')
+        elif ret[0] == 1:
+            return True
+        else:
+            raise Exception(f'mysql lock {self.lock_name} does not exist')
+
+    def __enter__(self):
+        if isinstance(self.db, PooledMySQLDatabase):
+            self.lock()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if isinstance(self.db, PooledMySQLDatabase):
+            self.unlock()
+
+    def __call__(self, func):
+        @wraps(func)
+        def magic(*args, **kwargs):
+            with self:
+                return func(*args, **kwargs)
+
+        return magic
+
+
+class DatabaseLock(Enum):
+    MYSQL = MysqlDatabaseLock
+    POSTGRES = PostgresDatabaseLock
+
+
+DB = BaseDataBase().database_connection
+DB.lock = DatabaseLock[settings.DATABASE_TYPE.upper()].value
